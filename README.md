@@ -1,46 +1,29 @@
-# Achat V2 — Bản nền tảng quản lý đa shop (MVP demo)
+# Achat V2.2 — Meta OAuth + Quản trị viên (BETA)
 
-## Đã có
-- Giao diện tiếng Việt theo bố cục Sapo Social tham khảo, thiết kế riêng cho Achat.
-- **Superadmin riêng** `/admin`: tạo shop, cấp thời hạn dùng thử mặc định 7 ngày, giới hạn page/nhân viên, gia hạn và khóa/mở shop, nhật ký thao tác.
-- **Shop riêng**: inbox 3 cột, hội thoại và nhãn, sản phẩm, đơn nháp, nhân viên với vai trò owner/manager/staff, danh sách page demo.
-- **Tách dữ liệu theo shop** bằng `shop_id` và lọc trong các truy vấn; mật khẩu hash; xác thực session.
-- **AI Check demo**: tìm SKU, số lượng, số điện thoại trong tin nhắn, tạo đơn nháp (không phải AI thực).
+Đây là bản phát triển tiếp từ V2.1, **KHÔNG PHẢI sản phẩm sẵn sàng thương mại**.
 
-## Chưa có / KHÔNG dùng kinh doanh thật
-- Chưa có Facebook OAuth, webhook, Messenger thật, FB Agent, AI LLM thật, đơn vị vận chuyển thật, thanh toán, đa kho, báo cáo thực, reset mật khẩu, CSRF, rate limiting, MFA, hàng đợi background, PostgreSQL, migrations và kiểm thử bảo mật độc lập.
-- SQLite cục bộ **không bền vững trên Render filesystem mặc định**: dữ liệu có thể mất sau restart/deploy. Để dùng thật cần PostgreSQL + backup.
-- Tài khoản demo có mật khẩu mặc định; bắt buộc đổi trước khi công khai.
-- Hệ thống có nền tảng phân quyền, nhưng **chưa đủ chuẩn bảo mật sản phẩm SaaS**.
+## Có gì mới
+- Super Admin chính tạo và khóa Super Admin phụ, nhật ký thao tác.
+- Facebook Login OAuth (server-side authorization code, state), lưu Page token bằng Fernet.
+- Liệt kê Page và giới hạn số lượng theo shop, không chiếm Page đã kết nối với shop khác.
+- Webhook GET verify và POST kiểm tra chữ ký SHA-256, chống trùng message id, lưu tin nhắn theo shop.
+- Gửi tin nhắn Messenger qua Graph API với quyền của Page khi hội thoại có Page-scoped sender ID.
+- Giữ giao diện ba cột, quản lý shop, nhân viên, sản phẩm và đơn nháp của V2.1.
 
-## Chạy trên iMac
-```bash
-cd achat_v2
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-python3 app.py
-```
-Mở `http://127.0.0.1:8080`
+## Triển khai
+1. Sao lưu cơ sở dữ liệu V2.1 trước khi nâng cấp. Trên Render Free không có ổ đĩa bền vững mặc định; SQLite có nguy cơ mất dữ liệu khi triển khai lại. Chưa nên nhập dữ liệu thật.
+2. Đưa **nội dung bên trong** thư mục `achat_v2_2` lên thư mục gốc repository GitHub, giữ nguyên `templates/`, `static/`, `Dockerfile`.
+3. Render chọn Web Service, Docker, branch main, Root Directory để trống.
+4. Thiết lập SECRET_KEY, ADMIN_EMAIL, ADMIN_PASSWORD, APP_ENV=production. Với SQLite chỉ để thử nghiệm: không đặt DATABASE_PATH=/data/... trừ khi đã gắn persistent disk. Nếu nâng cấp từ bản demo, giữ DB hiện có nếu cần dữ liệu cũ.
+5. Tạo TOKEN_ENCRYPTION_KEY bằng `python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. Giữ bí mật khóa; mất khóa sẽ không giải mã được token.
+6. Điền META_APP_ID, META_APP_SECRET, META_VERIFY_TOKEN, TOKEN_ENCRYPTION_KEY trong Render > Environment. Không đăng lên GitHub.
+7. Meta > Facebook Login > Valid OAuth Redirect URIs: `https://achat-rsya.onrender.com/facebook/callback` (thay bằng tên miền của bạn nếu khác).
+8. Meta > Webhooks > Page: Callback URL `https://achat-rsya.onrender.com/facebook/webhook`, Verify Token phải trùng META_VERIFY_TOKEN. Bật messages và messaging_postbacks khi được Meta cấp quyền.
+9. Đăng nhập chủ shop > Fanpage > Kết nối Facebook, rồi nhấn Đăng ký nhận tin trên từng page.
 
-## Đăng nhập thử
-- Superadmin: `admin@achat.local` / `ChangeMe123!`
-- Chủ shop: `owner@achat.local` / `ChangeMe123!`
-
-Có thể đặt mật khẩu khởi tạo bằng biến `ADMIN_PASSWORD` và `DEMO_OWNER_PASSWORD` **trước lần khởi tạo database đầu tiên**. Nếu database đã có, các biến này không đổi mật khẩu.
-
-## Triển khai Render
-1. Upload **toàn bộ file và thư mục** của dự án lên GitHub, thay thế bộ demo cũ.
-2. Render → Web Service → chọn repo → Language: Docker → Branch: main → Root Directory: trống.
-3. Environment: đặt `SECRET_KEY`, `ADMIN_PASSWORD`, `DEMO_OWNER_PASSWORD`, `DATABASE_PATH` (nếu có persistent disk).
-4. Deploy. Truy cập đường dẫn Render cung cấp.
-5. Chỉ sử dụng để **trình diễn**, không lưu thông tin khách thật.
-
-## Lộ trình bản thương mại
-1. PostgreSQL, Alembic migrations, CSRF, auth nâng cao, API đa tenant và audit đầy đủ.
-2. Meta OAuth, page permissions, webhook, Messenger sync và outbound messages.
-3. Catalog biến thể, kho, checkout và đối soát đơn.
-4. AI agent có xác nhận của khách và cơ chế tránh đơn trùng, chuyển giao nhân viên.
-5. API GHN/GHTK/BEST/Viettel Post..., batch push và in nhãn.
-6. Subscription, quota, hóa đơn, bảo mật, monitoring và triển khai đa khách hàng.
+## Giới hạn quan trọng
+- Phải được Meta cấp các quyền phù hợp (pages_show_list, pages_messaging, pages_manage_metadata); ứng dụng chưa được phê duyệt có thể chỉ hoạt động với tài khoản vai trò ứng dụng.
+- Chưa có hàng đợi webhook, retry, đồng bộ lịch sử, token lifecycle, Facebook comment, phân quyền chi tiết theo hội thoại, AI Agent thật, vận chuyển thật, in vận đơn, PostgreSQL, billing, 2FA và kiểm thử tải.
+- Webhook hiện xử lý đồng bộ, phù hợp thử nghiệm nhỏ, không đủ bền vững cho tải thương mại.
+- SQLite không phù hợp triển khai nhiều instance hoặc lưu dữ liệu production trên filesystem tạm.
+- Chỉ dùng để thử nghiệm nội bộ, không kết nối Page bán hàng thật cho đến khi bảo mật, sao lưu và chính sách dữ liệu được kiểm tra.

@@ -1,10 +1,26 @@
-import os, sqlite3, secrets, functools, re
+import os, sqlite3, secrets, functools, re, hmac, hashlib, json, base64, urllib.parse
+import requests
+from cryptography.fernet import Fernet, InvalidToken
 from datetime import datetime, timedelta, timezone
 from flask import Flask, render_template, request, redirect, url_for, session, flash, abort, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
+from flask_wtf.csrf import CSRFProtect
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 app=Flask(__name__)
 app.secret_key=os.getenv('SECRET_KEY','dev-only-change-this-secret')
+if os.getenv('APP_ENV') == 'production' and (len(app.secret_key)<32 or app.secret_key=='dev-only-change-this-secret'):
+    raise RuntimeError('Production requires SECRET_KEY with at least 32 characters')
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE='Lax', SESSION_COOKIE_SECURE=os.getenv('APP_ENV')=='production', WTF_CSRF_TIME_LIMIT=3600)
+app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1)
+csrf=CSRFProtect(app)
+@app.after_request
+def security_headers(response):
+    response.headers['X-Content-Type-Options']='nosniff'
+    response.headers['Referrer-Policy']='strict-origin-when-cross-origin'
+    response.headers['X-Frame-Options']='DENY'
+    response.headers['Cache-Control']='no-store' if request.path.startswith(('/admin','/inbox','/orders','/team','/pages','/products')) else 'private'
+    return response
 DB=os.getenv('DATABASE_PATH',os.path.join(os.path.dirname(__file__),'achat.sqlite3'))
 VN=timezone(timedelta(hours=7))
 def now(): return datetime.now(VN)
@@ -23,8 +39,21 @@ def init_db():
         CREATE TABLE IF NOT EXISTS orders(id INTEGER PRIMARY KEY,shop_id INTEGER NOT NULL REFERENCES shops(id),conversation_id INTEGER REFERENCES conversations(id),customer_id INTEGER REFERENCES customers(id),sku TEXT,qty INTEGER NOT NULL DEFAULT 1,amount INTEGER NOT NULL DEFAULT 0,shipping_fee INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'Chưa đẩy đơn',source TEXT NOT NULL DEFAULT 'Thủ công',created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY,shop_id INTEGER,actor_id INTEGER,action TEXT NOT NULL,details TEXT,created_at TEXT NOT NULL);
         ''')
+        c.executescript('''
+        CREATE TABLE IF NOT EXISTS system_admins(user_id INTEGER PRIMARY KEY REFERENCES users(id),is_primary INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS facebook_connections(id INTEGER PRIMARY KEY,shop_id INTEGER NOT NULL REFERENCES shops(id),page_id INTEGER NOT NULL REFERENCES pages(id),fb_page_id TEXT NOT NULL UNIQUE,token_encrypted TEXT NOT NULL,created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS webhook_events(mid TEXT PRIMARY KEY,received_at TEXT NOT NULL);
+        ''')
+        c.execute('INSERT OR IGNORE INTO system_admins(user_id,is_primary) SELECT id,1 FROM users WHERE role="superadmin" ORDER BY id LIMIT 1')
         if not c.execute('SELECT 1 FROM users WHERE role=?',('superadmin',)).fetchone():
-            t=now().isoformat(); c.execute('INSERT INTO users(shop_id,name,email,password_hash,role,created_at) VALUES(NULL,?,?,?,?,?)',('Quản trị hệ thống','admin@achat.local',generate_password_hash(os.getenv('ADMIN_PASSWORD','ChangeMe123!')),'superadmin',t))
+            t=now().isoformat()
+            admin_password=os.getenv('ADMIN_PASSWORD','ChangeMe123!')
+            admin_email=os.getenv('ADMIN_EMAIL','admin@achat.local')
+            if os.getenv('APP_ENV')=='production' and (len(admin_password)<12 or admin_password=='ChangeMe123!' or admin_email.endswith('.local')):
+                raise RuntimeError('Set ADMIN_EMAIL and a strong ADMIN_PASSWORD (12+ characters) in production')
+            c.execute('INSERT INTO users(shop_id,name,email,password_hash,role,created_at) VALUES(NULL,?,?,?,?,?)',('Quản trị hệ thống',admin_email,generate_password_hash(admin_password),'superadmin',t))
+            c.execute('INSERT OR IGNORE INTO system_admins(user_id,is_primary) SELECT id,1 FROM users WHERE role="superadmin" ORDER BY id LIMIT 1')
+            if os.getenv('APP_ENV')=='production': return
             c.execute('INSERT INTO shops(name,plan,trial_ends,max_pages,max_staff,created_at) VALUES(?,?,?,?,?,?)',('Shop Đan Đan','trial',(now()+timedelta(days=7)).isoformat(),2,3,t)); sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
             c.execute('INSERT INTO users(shop_id,name,email,password_hash,role,created_at) VALUES(?,?,?,?,?,?)',(sid,'Chủ shop Đan Đan','owner@achat.local',generate_password_hash(os.getenv('DEMO_OWNER_PASSWORD','ChangeMe123!')),'owner',t))
             c.execute('INSERT INTO pages(shop_id,name,created_at) VALUES(?,?,?)',(sid,'Đan Đan Fashion (demo)',t))
@@ -220,6 +249,189 @@ def pages():
         return redirect(url_for('pages'))
     with conn() as c:rows=c.execute('SELECT * FROM pages WHERE shop_id=?',(shop['id'],)).fetchall()
     return render_template('pages.html',shop=shop,pages=rows)
+
+# Facebook integration uses official Meta Graph API; requires approved permissions.
+META_VERSION=os.getenv('META_API_VERSION','v23.0')
+def meta_ready():
+    return all(os.getenv(k) for k in ('META_APP_ID','META_APP_SECRET','TOKEN_ENCRYPTION_KEY','META_VERIFY_TOKEN'))
+def token_cipher():
+    key=os.getenv('TOKEN_ENCRYPTION_KEY')
+    if not key:raise RuntimeError('Missing TOKEN_ENCRYPTION_KEY')
+    return Fernet(key.encode())
+def graph(path,token,method='GET',data=None):
+    url=f'https://graph.facebook.com/{META_VERSION}/{path.lstrip("/")}'
+    kwargs={'timeout':15,'headers':{'Authorization':f'Bearer {token}'}}
+    if method=='GET':kwargs['params']=data or {}
+    else:kwargs['json']=data or {}
+    r=requests.request(method,url,**kwargs)
+    r.raise_for_status()
+    return r.json()
+
+@app.route('/admin/system-users',methods=['GET','POST'])
+@roles('superadmin')
+def system_users():
+    with conn() as c:
+        primary=c.execute('SELECT is_primary FROM system_admins WHERE user_id=?',(current_user()['id'],)).fetchone()
+        if request.method=='POST':
+            if not primary or not primary['is_primary']:abort(403)
+            email=request.form.get('email','').strip().lower();name=request.form.get('name','').strip();pw=request.form.get('password','')
+            if not name or '@' not in email or len(pw)<12:flash('Tên, email hoặc mật khẩu không hợp lệ (tối thiểu 12 ký tự).','error')
+            else:
+                try:
+                    c.execute('INSERT INTO users(shop_id,name,email,password_hash,role,created_at) VALUES(NULL,?,?,?,?,?)',(name,email,generate_password_hash(pw),'superadmin',now().isoformat()))
+                    uid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                    c.execute('INSERT INTO system_admins(user_id,is_primary) VALUES(?,0)',(uid,));audit(c,'create_system_admin',email)
+                    flash('Đã tạo quản trị viên hệ thống.','success')
+                except sqlite3.IntegrityError:flash('Email đã tồn tại.','error')
+            return redirect(url_for('system_users'))
+        rows=c.execute('SELECT u.*,sa.is_primary FROM users u JOIN system_admins sa ON sa.user_id=u.id ORDER BY sa.is_primary DESC,u.id').fetchall()
+    return render_template('system_users.html',users=rows,primary=bool(primary and primary['is_primary']))
+
+@app.route('/admin/system-users/<int:uid>/toggle',methods=['POST'])
+@roles('superadmin')
+def toggle_system_user(uid):
+    with conn() as c:
+        actor=c.execute('SELECT is_primary FROM system_admins WHERE user_id=?',(current_user()['id'],)).fetchone()
+        target=c.execute('SELECT u.active,sa.is_primary FROM users u JOIN system_admins sa ON sa.user_id=u.id WHERE u.id=?',(uid,)).fetchone()
+        if not actor or not actor['is_primary'] or not target or target['is_primary']:abort(403)
+        c.execute('UPDATE users SET active=? WHERE id=?',(0 if target['active'] else 1,uid));audit(c,'toggle_system_admin',str(uid))
+    return redirect(url_for('system_users'))
+
+@app.route('/facebook/connect')
+@roles('owner','manager')
+def facebook_connect():
+    shop=shop_access()
+    if not shop:return redirect(url_for('pages'))
+    if not meta_ready():flash('Chưa cấu hình META_APP_ID, META_APP_SECRET, META_VERIFY_TOKEN và TOKEN_ENCRYPTION_KEY trên máy chủ.','error');return redirect(url_for('pages'))
+    nonce=secrets.token_urlsafe(32)
+    session['fb_oauth_state']=nonce
+    session['fb_oauth_shop']=shop['id']
+    params={'client_id':os.environ['META_APP_ID'],'redirect_uri':url_for('facebook_callback',_external=True,_scheme='https' if os.getenv('APP_ENV')=='production' else 'http'),'state':nonce,'scope':'pages_show_list,pages_messaging,pages_manage_metadata','response_type':'code'}
+    return redirect('https://www.facebook.com/'+META_VERSION+'/dialog/oauth?'+urllib.parse.urlencode(params))
+
+@app.route('/facebook/callback')
+@login_required
+def facebook_callback():
+    state=request.args.get('state','')
+    expected=session.pop('fb_oauth_state',None)
+    expected_shop=session.pop('fb_oauth_shop',None)
+    if not expected or not hmac.compare_digest(expected,state):abort(400)
+    if current_user()['role'] not in ('owner','manager'):abort(403)
+    shop=shop_access()
+    if not shop:return redirect(url_for('pages'))
+    if shop['id']!=expected_shop:abort(403)
+    code=request.args.get('code')
+    if not code:flash('Facebook không cấp mã xác thực.','error');return redirect(url_for('pages'))
+    redirect_uri=url_for('facebook_callback',_external=True,_scheme='https' if os.getenv('APP_ENV')=='production' else 'http')
+    try:
+        r=requests.get(f'https://graph.facebook.com/{META_VERSION}/oauth/access_token',params={'client_id':os.environ['META_APP_ID'],'client_secret':os.environ['META_APP_SECRET'],'redirect_uri':redirect_uri,'code':code},timeout=15)
+        r.raise_for_status();user_token=r.json()['access_token']
+        result=graph('me/accounts',user_token,data={'fields':'id,name,access_token','limit':100})
+        count=0
+        with conn() as c:
+            for page in result.get('data',[]):
+                fb_id=str(page['id']); page_token=page.get('access_token')
+                if not page_token:continue
+                owned=c.execute('SELECT shop_id FROM facebook_connections WHERE fb_page_id=?',(fb_id,)).fetchone()
+                if owned and owned['shop_id']!=shop['id']:continue
+                local=c.execute('SELECT id FROM pages WHERE shop_id=? AND facebook_page_id=?',(shop['id'],fb_id)).fetchone()
+                if not local:
+                    num=c.execute('SELECT COUNT(*) FROM pages WHERE shop_id=?',(shop['id'],)).fetchone()[0]
+                    if num>=shop['max_pages']:continue
+                    c.execute('INSERT INTO pages(shop_id,name,facebook_page_id,connected,created_at) VALUES(?,?,?,?,?)',(shop['id'],page['name'],fb_id,1,now().isoformat()))
+                    pid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                else:pid=local['id'];c.execute('UPDATE pages SET connected=1,name=? WHERE id=?',(page['name'],pid))
+                encrypted=token_cipher().encrypt(page_token.encode()).decode()
+                c.execute('INSERT INTO facebook_connections(shop_id,page_id,fb_page_id,token_encrypted,created_at) VALUES(?,?,?,?,?) ON CONFLICT(fb_page_id) DO UPDATE SET token_encrypted=excluded.token_encrypted',(shop['id'],pid,fb_id,encrypted,now().isoformat()))
+                count+=1
+            audit(c,'facebook_oauth',f'connected={count}')
+        flash(f'Đã lưu {count} fanpage. Cần cấu hình webhook và đăng ký subscribed_apps để nhận tin nhắn.','success')
+    except (requests.RequestException,KeyError,ValueError,InvalidToken) as e:
+        app.logger.exception('Facebook OAuth error')
+        flash('Không thể kết nối Facebook. Kiểm tra quyền Meta và cấu hình OAuth.','error')
+    return redirect(url_for('pages'))
+
+@app.route('/facebook/webhook',methods=['GET','POST'])
+@csrf.exempt
+def facebook_webhook():
+    if request.method=='GET':
+        if request.args.get('hub.mode')=='subscribe' and os.getenv('META_VERIFY_TOKEN') and hmac.compare_digest(request.args.get('hub.verify_token',''),os.environ['META_VERIFY_TOKEN']):
+            return request.args.get('hub.challenge',''),200
+        abort(403)
+    secret=os.getenv('META_APP_SECRET')
+    if not secret:abort(503)
+    raw=request.get_data()
+    signature=request.headers.get('X-Hub-Signature-256','')
+    expected='sha256='+hmac.new(secret.encode(),raw,hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature,expected):abort(403)
+    payload=request.get_json(silent=True) or {}
+    if payload.get('object')!='page':return 'EVENT_RECEIVED',200
+    with conn() as c:
+        for entry in payload.get('entry',[]):
+            page_fb_id=str(entry.get('id',''))
+            connection=c.execute('SELECT shop_id,page_id FROM facebook_connections WHERE fb_page_id=?',(page_fb_id,)).fetchone()
+            if not connection:continue
+            sid=connection['shop_id'];pid=connection['page_id']
+            for ev in entry.get('messaging',[]):
+                msg=ev.get('message') or {}
+                sender=str((ev.get('sender') or {}).get('id',''))
+                if not sender or not msg or msg.get('is_echo'):continue
+                mid=str(msg.get('mid',''))
+                if not mid:continue
+                if c.execute('SELECT 1 FROM webhook_events WHERE mid=?',(mid,)).fetchone():continue
+                c.execute('INSERT INTO webhook_events(mid,received_at) VALUES(?,?)',(mid,now().isoformat()))
+                customer=c.execute('SELECT id FROM customers WHERE shop_id=? AND phone=?',(sid,'fb:'+sender)).fetchone()
+                if not customer:
+                    c.execute('INSERT INTO customers(shop_id,name,phone) VALUES(?,?,?)',(sid,'Facebook '+sender[-6:],'fb:'+sender))
+                    cid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                else:cid=customer['id']
+                conversation=c.execute('SELECT id FROM conversations WHERE shop_id=? AND page_id=? AND customer_id=?',(sid,pid,cid)).fetchone()
+                if not conversation:
+                    c.execute('INSERT INTO conversations(shop_id,page_id,customer_id,tag,updated_at) VALUES(?,?,?,?,?)',(sid,pid,cid,'Khách mới',now().isoformat()))
+                    vid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+                else:vid=conversation['id']
+                body=msg.get('text') or '[Tin nhắn có tệp đính kèm]'
+                c.execute('INSERT INTO messages(shop_id,conversation_id,sender,body,created_at) VALUES(?,?,?,?,?)',(sid,vid,'customer',body[:10000],now().isoformat()))
+                c.execute('UPDATE conversations SET unread=1,updated_at=? WHERE id=? AND shop_id=?',(now().isoformat(),vid,sid))
+    return 'EVENT_RECEIVED',200
+
+@app.route('/facebook/conversations/<int:cid>/send',methods=['POST'])
+@login_required
+def facebook_send(cid):
+    shop=shop_access()
+    if not shop:return redirect(url_for('inbox'))
+    body=request.form.get('body','').strip()
+    if not body or len(body)>2000:flash('Tin nhắn phải có từ 1 đến 2000 ký tự.','error');return redirect(url_for('inbox',id=cid))
+    with conn() as c:
+        row=c.execute("""SELECT v.id,cu.phone,fc.fb_page_id,fc.token_encrypted FROM conversations v JOIN customers cu ON cu.id=v.customer_id JOIN facebook_connections fc ON fc.page_id=v.page_id AND fc.shop_id=v.shop_id WHERE v.id=? AND v.shop_id=?""",(cid,shop['id'])).fetchone()
+    if not row or not row['phone'].startswith('fb:'):abort(404)
+    try:
+        token=token_cipher().decrypt(row['token_encrypted'].encode()).decode()
+        graph('me/messages',token,method='POST',data={'recipient':{'id':row['phone'][3:]},'message':{'text':body},'messaging_type':'RESPONSE'})
+    except (requests.RequestException,InvalidToken,ValueError):
+        app.logger.exception('Facebook send failed')
+        flash('Facebook không chấp nhận tin nhắn. Kiểm tra quyền gửi và cửa sổ nhắn tin của Meta.','error')
+        return redirect(url_for('inbox',id=cid))
+    with conn() as c:
+        c.execute('INSERT INTO messages(shop_id,conversation_id,sender,body,created_at) VALUES(?,?,?,?,?)',(shop['id'],cid,'staff',body,now().isoformat()))
+        c.execute('UPDATE conversations SET updated_at=?,unread=0 WHERE id=? AND shop_id=?',(now().isoformat(),cid,shop['id']))
+        audit(c,'facebook_send',f'conversation={cid}')
+    flash('Đã gửi tin nhắn qua Facebook.','success')
+    return redirect(url_for('inbox',id=cid))
+
+@app.route('/facebook/pages/<int:pid>/subscribe',methods=['POST'])
+@roles('owner','manager')
+def facebook_subscribe(pid):
+    shop=shop_access()
+    if not shop:return redirect(url_for('pages'))
+    with conn() as c:connection=c.execute('SELECT * FROM facebook_connections WHERE page_id=? AND shop_id=?',(pid,shop['id'])).fetchone()
+    if not connection:abort(404)
+    try:
+        token=token_cipher().decrypt(connection['token_encrypted'].encode()).decode()
+        graph(connection['fb_page_id']+'/subscribed_apps',token,method='POST',data={'subscribed_fields':['messages','messaging_postbacks']})
+        flash('Đã yêu cầu đăng ký webhook cho fanpage.','success')
+    except (requests.RequestException,InvalidToken,ValueError):flash('Không đăng ký được webhook. Kiểm tra quyền ứng dụng Meta.','error')
+    return redirect(url_for('pages'))
 @app.route('/health')
 def health():return jsonify(status='ok')
 if __name__=='__main__':app.run(host='0.0.0.0',port=int(os.getenv('PORT','8080')),debug=False)
